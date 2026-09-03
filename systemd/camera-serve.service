@@ -1,0 +1,14 @@
+[Unit]
+Description=Pi Camera TCP Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/root/falcon-cmos/venv/bin/python /root/falcon-cmos/cmos_stream.py
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

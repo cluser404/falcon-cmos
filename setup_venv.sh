@@ -19,13 +19,13 @@ if ! python3 -c "import picamera2" 2>/dev/null; then
 fi
 
 if command -v uv >/dev/null 2>&1; then
-    uv venv --system-site-packages .venv
-    uv pip install --python .venv opencv-python-headless numpy
+    uv venv --system-site-packages venv
+    uv pip install --python venv opencv-python-headless numpy
 else
-    python3 -m venv --system-site-packages .venv
-    .venv/bin/pip install --upgrade pip
-    .venv/bin/pip install opencv-python-headless numpy
+    python3 -m venv --system-site-packages venv
+    venv/bin/pip install --upgrade pip
+    venv/bin/pip install opencv-python-headless numpy
 fi
 
 echo "Done. Run the server with:"
-echo "  .venv/bin/python cmos_stream.py"
+echo "  venv/bin/python cmos_stream.py"
