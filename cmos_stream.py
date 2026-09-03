@@ -66,9 +66,20 @@ def build_camera():
     # main + lores together, both running continuously off the same sensor
     # capture - this is what lets a CAPTURE command grab a full-res "main"
     # frame without ever stopping/reconfiguring the fast "lores" preview.
+    #
+    # buffer_count=2 (default is higher, e.g. 4-6) is required, not just an
+    # optimization: create_video_configuration also provisions a full-
+    # sensor-resolution "raw" stream feeding the ISP alongside main+lores,
+    # and on a memory-constrained Pi (the target board here has ~390MB
+    # total RAM, ~256MB of that CMA-reserved) the default buffer count
+    # across all three streams was enough to exhaust the DMA heap outright
+    # (OSError: Cannot allocate memory, before the camera could even start)
+    # - not a slowness issue, a hard failure. 2 buffers per stream is the
+    # minimum for continuous double-buffered capture and comfortably fits.
     config = picam2.create_video_configuration(
         main={"size": FULL_SIZE, "format": "RGB888"},
         lores={"size": PREVIEW_SIZE, "format": "YUV420"},
+        buffer_count=2,
     )
     picam2.configure(config)
     picam2.start()
