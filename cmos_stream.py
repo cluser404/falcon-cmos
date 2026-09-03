@@ -4,33 +4,51 @@
 Continuously streams small, fast JPEG preview frames to the connected
 client (falcon's CMOS device - see ../falcon/src/falcon/devices/cmos.py)
 and, only when the client sends a "CAPTURE" command, captures and sends a
-single lossless full-resolution PNG frame instead - so the live preview
-stays fast, AND the on-demand full-res capture itself is controlled
-(happens only on request) and fast (not just correct): the "main" stream
-is always running alongside "lores" (see build_camera), so grabbing its
-current frame is effectively instant with nothing to reconfigure/re-
-trigger, and encode_full's PNG compression level is tuned down from PIL's
-slow default specifically so the encode - the actual bottleneck on the
-Pi's CPU - doesn't turn a "fast on-demand capture" into a multi-second
-wait. See FULL_PNG_COMPRESS_LEVEL.
+single full-resolution frame instead - so the live preview stays fast,
+AND the on-demand full-res capture itself is controlled (happens only on
+request) and fast (not just correct).
+
+The full-res frame is sent as RAW, UNCOMPRESSED pixel bytes, not PNG -
+this is deliberate, found by measuring on the actual target hardware
+(a memory-constrained Pi: ~390MB RAM, already under enough memory
+pressure to be swapping). Acquisition is fast either way (capture_array
+on the continuously-running "main" stream, ~0.1s measured, nothing to
+reconfigure/re-trigger) - the bottleneck was PNG-encoding the ~24MB frame
+on this CPU, which measured 5-38s (erratic - consistent with swap
+thrashing under memory pressure, not just raw compute cost) REGARDLESS of
+PNG compression level (an earlier attempt at tuning that level down is
+why you may see it referenced elsewhere in history; it did not fix this).
+Sending raw bytes instead skips that entirely: the client (falcon,
+running on a real desktop CPU with far more headroom) does the lossless
+PNG encode itself when it actually writes a capture to disk - see
+CMOS._read_frames in devices/cmos.py.
 
 Wire protocol
 -------------
 Outgoing frames (Pi -> client), one per streamed image:
-    1 byte    type: b"P" = JPEG preview frame, b"F" = full-res PNG frame
+    1 byte    type: b"P" = JPEG preview frame, b"F" = full-res raw frame
     4 bytes   big-endian uint32 payload length
-    N bytes   the JPEG- or PNG-encoded image
+    N bytes   the payload (format depends on type, see below)
+
+"P" payload: JPEG-encoded preview image bytes, decode directly.
+"F" payload: 8 bytes (big-endian uint32 width, uint32 height) followed by
+    width*height*3 raw interleaved BGR uint8 bytes (row-major, no padding)
+    - picamera2's "RGB888" format is, despite the name, laid out as BGR in
+    memory (a documented picamera2 quirk), which is also directly the byte
+    order OpenCV/cv2 expects, so this needs no color conversion on either
+    end; confirmed empirically against the known-correct PIL-based capture
+    path before switching to this raw path (channel means tracked pairwise
+    across both, ruling out a channel swap).
 
 Incoming commands (client -> Pi), newline-terminated ASCII lines:
-    CAPTURE   request exactly one full-resolution PNG frame. The preview
+    CAPTURE   request exactly one full-resolution raw frame. The preview
               stream keeps flowing in between requests; the single "F"
-              frame is interleaved into it as soon as the capture and PNG
-              encode complete.
+              frame is interleaved into it as soon as the capture
+              completes.
 
 One client at a time (same as the original single-stream script this
 replaces). Requires: picamera2, opencv-python, numpy.
 """
-import io
 import socket
 import struct
 import threading
@@ -46,19 +64,10 @@ FULL_SIZE = (3280, 2464)    # Pi Camera v2 full resolution - "main" stream
 PREVIEW_SIZE = (640, 480)   # fast preview - "lores" stream
 PREVIEW_JPEG_QUALITY = 75
 
-# PNG compression level (0-9, PIL/zlib's deflate level - the same knob
-# Pillow's PNG writer exposes as `compress_level`). This ONLY trades encode
-# CPU time for output size - it never touches image data, so the full-res
-# capture stays exactly as lossless at level 1 as it would at the default
-# level 6. Level 6 (PIL's default, used by the original single-stream
-# script) is what made a CAPTURE reply take multiple seconds on the Pi's
-# CPU; level 1 is dramatically faster to encode for a modest size increase,
-# which is what actually makes "request full-res, get it back fast" true.
-FULL_PNG_COMPRESS_LEVEL = 1
-
 TYPE_PREVIEW = b"P"
 TYPE_FULL = b"F"
-HEADER = struct.Struct(">cI")  # type byte + big-endian uint32 length
+HEADER = struct.Struct(">cI")      # type byte + big-endian uint32 length
+FULL_DIMS = struct.Struct(">II")   # "F" payload's own width/height sub-header
 
 
 def build_camera():
@@ -94,26 +103,14 @@ def encode_preview(picam2):
     return buf.tobytes() if ok else None
 
 
-def encode_full(picam2):
-    # capture_file (rather than a manual capture_array + cv2 encode) matches
-    # the original single-stream script's tested-working full-res PNG path:
-    # it goes through PIL, which handles the "main" stream's RGB888 pixel
-    # layout correctly without a hand-rolled, easy-to-get-wrong color-order
-    # conversion. Grabbing "main"'s current buffer is itself effectively
-    # instant - it's already continuously running alongside "lores" (see
-    # build_camera), so there's no reconfigure/re-trigger to wait on here;
-    # the PNG *encode* is the only real cost, which compress_level below
-    # addresses.
-    buf = io.BytesIO()
-    try:
-        picam2.capture_file(buf, format="png", name="main", compress_level=FULL_PNG_COMPRESS_LEVEL)
-    except TypeError:
-        # Some picamera2 versions may not forward PNG save kwargs through
-        # capture_file - fall back to its default (slower) compression
-        # rather than failing the capture outright.
-        buf = io.BytesIO()
-        picam2.capture_file(buf, format="png", name="main")
-    return buf.getvalue()
+def build_full_payload(picam2):
+    # No encoding step at all, deliberately - see the module docstring for
+    # why (PNG-encoding this frame on the Pi's CPU was the actual
+    # bottleneck, not acquisition). capture_array on the continuously-
+    # running "main" stream just returns its current buffer.
+    arr = picam2.capture_array("main")
+    h, w = arr.shape[:2]
+    return FULL_DIMS.pack(w, h) + arr.tobytes()
 
 
 def command_reader(conn, capture_event, stop_event):
@@ -155,7 +152,7 @@ def serve_client(conn, addr, picam2):
         while not stop_event.is_set():
             if capture_event.is_set():
                 capture_event.clear()
-                payload = encode_full(picam2)
+                payload = build_full_payload(picam2)
                 send_frame(conn, TYPE_FULL, payload)
                 continue
 
@@ -180,7 +177,7 @@ def main():
 
     print(
         f"Listening on {HOST}:{PORT} - preview {PREVIEW_SIZE[0]}x{PREVIEW_SIZE[1]} JPEG, "
-        f"full-res {FULL_SIZE[0]}x{FULL_SIZE[1]} PNG on CAPTURE"
+        f"full-res {FULL_SIZE[0]}x{FULL_SIZE[1]} raw BGR on CAPTURE"
     )
 
     try:
