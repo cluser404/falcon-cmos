@@ -1,0 +1,18 @@
+[project]
+name = "falcon-cmos"
+version = "0.1.0"
+description = "Raspberry Pi streaming server for FALCON's CMOS microscope camera"
+requires-python = ">=3.9"
+dependencies = [
+    "opencv-python-headless",
+    "numpy",
+]
+
+[tool.uv]
+# picamera2 (and the libcamera bindings it wraps) is not a normal PyPI
+# package here - on Raspberry Pi OS it comes from apt
+# (`sudo apt install -y python3-picamera2`), built against that OS image's
+# libcamera/system Python. The venv below is created with
+# --system-site-packages specifically so it can still see that apt-installed
+# picamera2 instead of trying (and likely failing) to pip-install it.
+package = false
