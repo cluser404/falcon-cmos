@@ -41,3 +41,17 @@ client requests a full-res frame by sending the ASCII line `CAPTURE\n`.
 
 The falcon app's client side lives in
 `../falcon/src/falcon/devices/cmos.py` (`CMOS.request_hires()`).
+
+## Tuning capture speed
+
+The full-res `CAPTURE` reply is meant to be fast, not just correct: the
+"main" stream runs continuously alongside "lores" so grabbing its current
+frame has nothing to reconfigure/re-trigger, and `FULL_PNG_COMPRESS_LEVEL`
+in `cmos_stream.py` (0-9, default `1`) trades PNG file size for encode
+speed - it's purely a zlib compression-level knob, so the frame stays
+exactly as lossless at `1` as at the default `6`. If a `CAPTURE` round trip
+still feels slow on real hardware, lowering this further (or raising it if
+you'd rather trade speed back for smaller files) is the first thing to try
+before anything else - PREVIEW_JPEG_QUALITY and the preview/full sizes are
+the other two levers, but the preview path (JPEG, small frame) was never
+the bottleneck.

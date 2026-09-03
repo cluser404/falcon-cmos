@@ -5,8 +5,14 @@ Continuously streams small, fast JPEG preview frames to the connected
 client (falcon's CMOS device - see ../falcon/src/falcon/devices/cmos.py)
 and, only when the client sends a "CAPTURE" command, captures and sends a
 single lossless full-resolution PNG frame instead - so the live preview
-stays fast while a real capture (used for detection/analysis and saved to
-disk) still gets the full-quality image.
+stays fast, AND the on-demand full-res capture itself is controlled
+(happens only on request) and fast (not just correct): the "main" stream
+is always running alongside "lores" (see build_camera), so grabbing its
+current frame is effectively instant with nothing to reconfigure/re-
+trigger, and encode_full's PNG compression level is tuned down from PIL's
+slow default specifically so the encode - the actual bottleneck on the
+Pi's CPU - doesn't turn a "fast on-demand capture" into a multi-second
+wait. See FULL_PNG_COMPRESS_LEVEL.
 
 Wire protocol
 -------------
@@ -19,8 +25,7 @@ Incoming commands (client -> Pi), newline-terminated ASCII lines:
     CAPTURE   request exactly one full-resolution PNG frame. The preview
               stream keeps flowing in between requests; the single "F"
               frame is interleaved into it as soon as the capture and PNG
-              encode complete (this can take noticeably longer than a
-              preview frame, since it's a full-resolution lossless image).
+              encode complete.
 
 One client at a time (same as the original single-stream script this
 replaces). Requires: picamera2, opencv-python, numpy.
@@ -40,6 +45,16 @@ PORT = 5000
 FULL_SIZE = (3280, 2464)    # Pi Camera v2 full resolution - "main" stream
 PREVIEW_SIZE = (640, 480)   # fast preview - "lores" stream
 PREVIEW_JPEG_QUALITY = 75
+
+# PNG compression level (0-9, PIL/zlib's deflate level - the same knob
+# Pillow's PNG writer exposes as `compress_level`). This ONLY trades encode
+# CPU time for output size - it never touches image data, so the full-res
+# capture stays exactly as lossless at level 1 as it would at the default
+# level 6. Level 6 (PIL's default, used by the original single-stream
+# script) is what made a CAPTURE reply take multiple seconds on the Pi's
+# CPU; level 1 is dramatically faster to encode for a modest size increase,
+# which is what actually makes "request full-res, get it back fast" true.
+FULL_PNG_COMPRESS_LEVEL = 1
 
 TYPE_PREVIEW = b"P"
 TYPE_FULL = b"F"
@@ -73,9 +88,20 @@ def encode_full(picam2):
     # the original single-stream script's tested-working full-res PNG path:
     # it goes through PIL, which handles the "main" stream's RGB888 pixel
     # layout correctly without a hand-rolled, easy-to-get-wrong color-order
-    # conversion.
+    # conversion. Grabbing "main"'s current buffer is itself effectively
+    # instant - it's already continuously running alongside "lores" (see
+    # build_camera), so there's no reconfigure/re-trigger to wait on here;
+    # the PNG *encode* is the only real cost, which compress_level below
+    # addresses.
     buf = io.BytesIO()
-    picam2.capture_file(buf, format="png", name="main")
+    try:
+        picam2.capture_file(buf, format="png", name="main", compress_level=FULL_PNG_COMPRESS_LEVEL)
+    except TypeError:
+        # Some picamera2 versions may not forward PNG save kwargs through
+        # capture_file - fall back to its default (slower) compression
+        # rather than failing the capture outright.
+        buf = io.BytesIO()
+        picam2.capture_file(buf, format="png", name="main")
     return buf.getvalue()
 
 
